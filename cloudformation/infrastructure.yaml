@@ -1,0 +1,621 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+# Security responsibilities: This template configures security controls
+# following the AWS Shared Responsibility Model
+# (https://aws.amazon.com/compliance/shared-responsibility-model/).
+# AWS is responsible for security OF the cloud (Amazon Virtual Private Cloud (Amazon VPC) service software,
+# Amazon Elastic Compute Cloud (Amazon EC2) hypervisor, AWS Systems Manager service availability, host OS
+# patching for managed services). You are responsible for security IN the
+# cloud, including reviewing Amazon VPC Flow Logs, monitoring bastion access via
+# AWS CloudTrail, and operating any Amazon EC2 instances launched outside of
+# this template. See docs/SECURITY.md for the full responsibilities split.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Patch Compliance Dashboard - Infrastructure Stack (Amazon Virtual Private Cloud (Amazon VPC), Networking, Bastion Amazon Elastic Compute Cloud (Amazon EC2))'
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block for the Amazon Virtual Private Cloud (Amazon VPC)
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: CIDR block for private subnet 1
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: CIDR block for private subnet 2
+
+  BastionInstanceType:
+    Type: String
+    Default: 't3.micro'
+    Description: EC2 instance type for bastion host
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: Latest Amazon Linux 2023 AMI ID
+
+  S3PrefixListId:
+    Type: String
+    Default: ''
+    Description: >-
+      AWS-managed prefix list ID for Amazon S3 in this Region (e.g.
+      pl-63a5400a for us-east-1). The AWS Lambda security group uses
+      this to allow egress to Amazon S3 via the Gateway Endpoint —
+      Amazon S3 IPs are not within the Amazon VPC CIDR, so a CIDR rule will
+      not work. The deploy script auto-resolves this via
+      `aws ec2 describe-prefix-lists`. If empty (e.g. when deploying
+      the stack manually), the Cache AWS Lambda function will not be
+      able to reach Amazon S3.
+
+  DataSyncBucketName:
+    Type: String
+    Description: >-
+      Name of the existing Amazon S3 Resource Data Sync bucket. Used to
+      scope the Amazon S3 Gateway Endpoint policy to read-only access
+      on the four Resource Data Sync prefixes. Must match the bucket
+      name passed to the compute stack.
+
+  DashboardBucketName:
+    Type: String
+    Description: >-
+      Name of the Amazon S3 Dashboard bucket created by bucket.yaml.
+      Used to scope the Amazon S3 Gateway Endpoint policy to the
+      cache, frontend, and lambda prefixes only. Must match the bucket
+      name passed to the compute stack.
+
+Conditions:
+  HasS3PrefixList: !Not [!Equals [!Ref S3PrefixListId, '']]
+
+Resources:
+  #############################################
+  # Notes on bucket and AWS Identity and Access Management (AWS IAM) placement
+  #############################################
+  # Amazon S3 buckets are intentionally NOT defined in this template:
+  #   - DataSyncBucketName: customer-owned, pre-existing Resource Data
+  #     Sync target. Out of scope; managed by the customer's existing
+  #     AWS Systems Manager Resource Data Sync configuration. Encryption, versioning,
+  #     and access logging are the customer's responsibility per their
+  #     organizational standards.
+  #   - DashboardBucketName: created by cloudformation/bucket.yaml with
+  #     PublicAccessBlock (all four flags), SSE-S3 default encryption,
+  #     versioning, TLS-only bucket policy, server access logging to a
+  #     dedicated log bucket, and lifecycle expiration of noncurrent
+  #     versions. See bucket.yaml for the full key management strategy.
+  #
+  # AWS Lambda execution roles, the Application Load Balancer access log
+  # bucket, and Amazon CloudWatch Lambda Log Groups are defined in
+  # cloudformation/compute.yaml. This stack provides the network plumbing
+  # (Amazon VPC, subnets, endpoints, security groups, bastion) only.
+  #
+  # Data classification, retention, and handling procedures for the data
+  # this workload processes are documented in docs/SECURITY.md.
+
+  #############################################
+  # Amazon VPC and Subnets
+  #############################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-2'
+
+  #############################################
+  # Route Tables
+  #############################################
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  #############################################
+  # Security Groups
+  #############################################
+  # Amazon VPC endpoint security group. Ingress is added via separate
+  # SecurityGroupIngress resources below to avoid circular dependencies with
+  # LambdaSecurityGroup and BastionSecurityGroup.
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Amazon VPC Endpoints
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: Allow HTTPS responses to Amazon VPC resources
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpce-sg'
+
+  VPCEndpointIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: HTTPS from Lambda SG
+
+  VPCEndpointIngressFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Description: HTTPS from Bastion SG
+
+  # ALB security group. Ingress is intentionally pinned to the bastion's
+  # security group via a separate AWS::EC2::SecurityGroupIngress resource
+  # below, so the only way into the ALB is through the bastion the
+  # template creates. No other VPC instance can reach the ALB even with
+  # SSM permissions or shell access — see docs/SECURITY.md.
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for internal ALB (ingress restricted to bastion SG)
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: Allow HTTPS to Lambda targets in Amazon VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  # Pin ALB ingress to the bastion's security group only. Defined as a
+  # separate resource to break the circular dependency between
+  # ALBSecurityGroup and BastionSecurityGroup.
+  #
+  # This is the network-layer enforcement of "the bastion is the only
+  # entry point". Even an operator with broad ssm:StartSession across
+  # the account cannot port-forward through any other instance to reach
+  # this ALB. To grant access to a different bastion or a different
+  # access pattern, edit this resource explicitly — the convention
+  # becomes a hard control instead of a documented promise.
+  ALBIngressFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Description: HTTPS only from bastion SG
+
+  # Lambda egress is restricted to:
+  #   1. The S3 prefix list (for the S3 Gateway Endpoint path).
+  #   2. The Amazon VPC endpoint security group (for AWS Systems Manager interface endpoints).
+  # No general internet egress.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-sg'
+
+  # Egress to S3 via the AWS-managed S3 prefix list. Required because the
+  # S3 Gateway Endpoint uses the prefix list as the destination — S3 IPs
+  # are NOT inside the Amazon VPC CIDR, so a CIDR-based rule will not work.
+  LambdaEgressToS3PrefixList:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: HasS3PrefixList
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationPrefixListId: !Ref S3PrefixListId
+      Description: HTTPS to S3 via prefix list
+
+  # Lambda -> Amazon VPC endpoint SG egress (separate resource to avoid circular
+  # reference with VPCEndpointSecurityGroup).
+  LambdaEgressToVPCEndpoints:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: HTTPS to AWS Systems Manager interface endpoints (from Lambda)
+
+  # Bastion egress is added via separate AWS::EC2::SecurityGroupEgress
+  # resources below to avoid circular references with ALBSecurityGroup
+  # and VPCEndpointSecurityGroup.
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for bastion host
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-sg'
+
+  # Bastion → ALB egress, pinned to the ALB security group. Symmetric
+  # to ALBIngressFromBastion above. Even though the ALB also lives in
+  # the VPC, scoping by SG (not VPC CIDR) keeps egress as narrow as
+  # ingress so a misconfiguration on either side fails closed.
+  BastionEgressToALB:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref BastionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref ALBSecurityGroup
+      Description: HTTPS to ALB (only)
+
+  BastionEgressToVPCEndpoints:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref BastionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: HTTPS to AWS Systems Manager interface endpoints (from bastion)
+
+  #############################################
+  # VPC Endpoints for Amazon S3, AWS Systems Manager (SSM),
+  # and AWS Systems Manager Messages (SSM Messages)
+  #############################################
+  # Gateway endpoint for Amazon S3. Asymmetric scoping by intent:
+  #   - DataSync bucket: whole-bucket wildcard. This is the customer's
+  #     existing bucket and may contain Resource Data Sync inventory
+  #     types beyond patches (AWS:Service, AWS:Network, custom types).
+  #     Prefix-scoping here would silently break new inventory types.
+  #   - Dashboard bucket: prefix-scoped to cache/*, frontend/*, lambda/*.
+  #     This bucket is created and owned by this workload; the prefix
+  #     set is closed.
+  #
+  # Defense in depth: the Cache Lambda IAM role in compute.yaml scopes
+  # to specific DataSync prefixes regardless of what the endpoint policy
+  # allows. The endpoint is the network gate; the role is the identity
+  # gate.
+  #
+  # Cross-account DataSync buckets: extend AllowDataSyncRead with the
+  # remote bucket ARN and add the remote account's `aws:PrincipalAccount`
+  # to the condition.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowDataSyncRead
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub 'arn:aws:s3:::${DataSyncBucketName}'
+              - !Sub 'arn:aws:s3:::${DataSyncBucketName}/*'
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+              Bool:
+                aws:SecureTransport: true
+          - Sid: AllowDashboardCacheReadWrite
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !Sub 'arn:aws:s3:::${DashboardBucketName}'
+              - !Sub 'arn:aws:s3:::${DashboardBucketName}/cache/*'
+              - !Sub 'arn:aws:s3:::${DashboardBucketName}/frontend/*'
+              - !Sub 'arn:aws:s3:::${DashboardBucketName}/lambda/*'
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+              Bool:
+                aws:SecureTransport: true
+
+  # AWS Systems Manager (SSM) endpoint policy: scoped to the actions
+  # required for AWS Systems Manager agent registration, association polling, and
+  # Session Manager document retrieval. The Session Manager channel
+  # actions live on the AWS Systems Manager Messages endpoint below. Resources remain
+  # `*` because the AWS Systems Manager APIs in use do not support ARN-level resource
+  # scoping; the account-principal condition is the resource-side bound.
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSSMAgentAndSessionManager
+            Effect: Allow
+            Principal: '*'
+            Action:
+              # Agent registration and heartbeat
+              - ssm:UpdateInstanceInformation
+              # Association polling (agent does this even with zero associations)
+              - ssm:ListAssociations
+              - ssm:ListInstanceAssociations
+              - ssm:DescribeAssociation
+              - ssm:UpdateAssociationStatus
+              - ssm:UpdateInstanceAssociationStatus
+              # Session Manager document fetch (AWS-StartPortForwardingSessionToRemoteHost)
+              - ssm:GetDocument
+              - ssm:DescribeDocument
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+
+  # AWS Systems Manager Messages (SSM Messages) endpoint policy:
+  # scoped to the four channel actions used by Session Manager. These
+  # APIs do not support resource-level ARN scoping. The bastion uses
+  # these for the port-forwarding tunnel.
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSessionManagerChannels
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenDataChannel
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+
+  #############################################
+  # VPC Flow Logs
+  #############################################
+  FlowLogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${AWS::StackName}'
+      RetentionInDays: 90
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogDelivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt FlowLogLogGroup.Arn
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc-flowlog'
+
+  #############################################
+  # Bastion AWS Identity and Access Management (AWS IAM) Role and Instance Profile
+  #############################################
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-role'
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BastionRole
+
+  #############################################
+  # Bastion EC2 Instance
+  #############################################
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref BastionInstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      # IMDSv2 required for instance metadata access
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: enabled
+      # Encrypted root EBS volume on gp3.
+      # Key management strategy: AWS-managed Amazon EBS key (alias/aws/ebs).
+      # Chosen because (a) the data on the bastion root volume is OS state
+      # and AWS Systems Manager agent configuration only — no customer data — (b) it
+      # auto-rotates annually with no operator action, and (c) it incurs
+      # no per-key AWS KMS charges. For deployments that mandate
+      # customer-managed AWS KMS keys for all encrypted EBS volumes, add
+      # `KmsKeyId: <customer-managed-key-arn>` under Ebs: and grant
+      # `ec2.amazonaws.com` in the key policy.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            Encrypted: true
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion'
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+
+  PrivateSubnetIds:
+    Description: Comma-separated list of private subnet IDs
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+
+  ALBSecurityGroupId:
+    Description: ALB Security Group ID
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  LambdaSecurityGroupId:
+    Description: Lambda Security Group ID
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaSecurityGroupId'
+
+  VPCEndpointSecurityGroupId:
+    Description: VPC Endpoint Security Group ID
+    Value: !Ref VPCEndpointSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCEndpointSecurityGroupId'
+
+  BastionInstanceId:
+    Description: Bastion EC2 Instance ID
+    Value: !Ref BastionInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-BastionInstanceId'
+
+  PrivateRouteTableId:
+    Description: Private Route Table ID
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateRouteTableId'

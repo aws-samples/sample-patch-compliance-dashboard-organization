@@ -1,0 +1,20 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Licensed under the MIT-0 License. See the LICENSE file.
+ */
+
+/*
+ * Make data rows in the accounts table look clickable. The component already
+ * wires onRowClick to navigate to the account detail page; these styles add
+ * the missing visual affordance (cursor + hover background) so users see
+ * that the row is interactive before they click. The Account-cell <Link>
+ * is the primary affordance for keyboard users; this is the secondary
+ * affordance for pointer users.
+ */
+.accounts-table-clickable-rows table tbody tr {
+  cursor: pointer;
+}
+
+.accounts-table-clickable-rows table tbody tr:hover {
+  background-color: var(--color-background-dropdown-item-hover, #f4f4f4);
+}

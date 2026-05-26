@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+# Sample member template for an AWS CloudFormation StackSet that creates
+# an AWS Systems Manager Resource Data Sync in every member account and
+# every target Region. All member accounts write inventory into a single
+# customer-supplied Amazon S3 bucket in a customer-supplied home Region.
+#
+# This template is deployed by AWS CloudFormation StackSets, not by
+# `deploy.sh`. Customers create the StackSet in their management or
+# delegated administrator account, point the StackInstances at their
+# organizational units, and pass `BucketName` and `BucketRegion` as
+# parameters. See cloudformation/sample/README.md for the full setup.
+#
+# This template does NOT create the destination Amazon S3 bucket and does
+# NOT manage the bucket policy. The customer creates the bucket once in
+# the central account and writes its policy to permit
+# `ssm.amazonaws.com` from every source account ID. See the README for
+# the bucket-policy template that pairs with this file.
+
+Description: 'Sample - Resource Data Sync (member template, deployed by CloudFormation StackSet)'
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: >-
+      Name of the central Amazon S3 bucket that all member accounts
+      write into. The bucket is owned by the central account; this
+      template runs in the member account and only configures the
+      sync, not the bucket. Must already exist with a bucket policy
+      that permits ssm.amazonaws.com from accounts.
+
+  BucketRegion:
+    Type: String
+    Description: >-
+      AWS Region of the central Amazon S3 bucket. All sync writes are
+      directed to this Region regardless of where the StackSet
+      instance runs. Example - us-east-1.
+
+  SyncName:
+    Type: String
+    Default: patch-inventory-sync
+    Description: >-
+      Name of the Resource Data Sync. Must be unique per Region per
+      account. Keep this consistent across all members so operators
+      can find syncs by name.
+
+Resources:
+  ResourceDataSync:
+    Type: AWS::SSM::ResourceDataSync
+    Properties:
+      SyncName: !Ref SyncName
+      SyncType: SyncToDestination
+      S3Destination:
+        BucketName: !Ref BucketName
+        BucketRegion: !Ref BucketRegion
+        SyncFormat: JsonSerDe
+
+Outputs:
+  SyncName:
+    Description: Resource Data Sync name configured in this account/region
+    Value: !Ref SyncName
+
+  Destination:
+    Description: Where inventory from this account/region is being written
+    Value: !Sub 's3://${BucketName} in ${BucketRegion}'

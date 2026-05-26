@@ -1,0 +1,238 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+# Security responsibilities: This template configures security controls
+# following the AWS Shared Responsibility Model
+# (https://aws.amazon.com/compliance/shared-responsibility-model/).
+# AWS is responsible for security OF the cloud (Amazon S3 service software,
+# Amazon S3-managed encryption key rotation for SSE-S3, durability). You are
+# responsible for security IN the cloud, including reviewing server access
+# logs, deciding between SSE-S3 and a customer-managed AWS Key Management Service (AWS KMS) key, and
+# configuring any additional bucket-level controls (such as MFA Delete) that
+# cannot be set via AWS CloudFormation. See docs/SECURITY.md for the full
+# responsibilities split.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Patch Compliance Dashboard - Bucket Stack (Amazon S3 Dashboard bucket and Amazon S3 access-log bucket with baseline controls)'
+
+Parameters:
+  DashboardBucketName:
+    Type: String
+    Description: >-
+      Name of the Amazon S3 Dashboard bucket to create. Must be globally
+      unique. Convention: ${StackName}-dashboard-${AccountId}.
+
+  DeployPrincipalArn:
+    Type: String
+    Default: ''
+    Description: >-
+      (Optional) ARN of the AWS Identity and Access Management (AWS IAM) principal that performs deployments and needs
+      PutObject on lambda/* and frontend/* prefixes. If empty, falls back to
+      any principal in this account (suitable for dev; tighten for prod).
+
+Conditions:
+  HasDeployPrincipal: !Not [!Equals [!Ref DeployPrincipalArn, '']]
+
+Resources:
+  #############################################
+  # Bucket for server access logs of the Dashboard bucket
+  #############################################
+  # Note: this bucket intentionally does not declare LoggingConfiguration.
+  # It is the destination for server access logs from DashboardBucket.
+  # Enabling server access logging on a log destination bucket creates
+  # an infinite recursive log delivery loop — every delivered log object
+  # generates a new log entry, which generates another, and so on. AWS
+  # documentation explicitly warns against this pattern:
+  #   https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerLogs.html
+  # For additional forensic visibility, enable CloudTrail data events on
+  # this bucket — see docs/HARDENING.md recommendation #2.
+  DashboardAccessLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DashboardBucketName}-logs'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Versioning enabled so accidental deletion of access logs leaves a
+      # delete marker rather than removing the object outright. Lifecycle
+      # rule below expires noncurrent versions after 30 days to bound cost.
+      VersioningConfiguration:
+        Status: Enabled
+      # Server access logging requires the log bucket to use object ACLs.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+
+  DashboardAccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardAccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt DashboardAccessLogBucket.Arn
+              - !Sub '${DashboardAccessLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: AllowS3LogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${DashboardAccessLogBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${DashboardBucketName}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  #############################################
+  # Dashboard Amazon S3 bucket (holds cache, AWS Lambda zips, frontend assets)
+  #############################################
+  # Key management strategy:
+  #   - Default: server-side encryption with Amazon S3-managed keys (SSE-S3, AES-256).
+  #     Chosen because (a) it incurs no AWS KMS charges, (b) Amazon S3
+  #     automatically rotates encryption keys with no operator action,
+  #     (c) no key policy maintenance is required, and (d) the data
+  #     classification (Internal — Operational, see docs/SECURITY.md)
+  #     does not mandate customer-controlled keys.
+  #   - Compliance-regulated deployments: switch to a customer-managed
+  #     AWS KMS key (see docs/HARDENING.md recommendation 5).
+  #
+  # Baseline controls applied below:
+  #   - PublicAccessBlock on all four flags
+  #   - SSE-S3 encryption by default (AWS-managed key)
+  #   - Versioning enabled (rollback on tampering or corruption)
+  #   - TLS-only access via bucket policy
+  #   - Server access logs to DashboardAccessLogBucket
+  #   - Lifecycle: noncurrent versions expire after 30 days
+  #
+  # Customer-managed key: to use a customer-managed AWS KMS key,
+  # replace the BucketEncryption block with:
+  #   BucketEncryption:
+  #     ServerSideEncryptionConfiguration:
+  #       - ServerSideEncryptionByDefault:
+  #           SSEAlgorithm: aws:kms
+  #           KMSMasterKeyID: <customer-managed-key-arn>
+  #         BucketKeyEnabled: true
+  # and verify the AWS Lambda roles have kms:Decrypt /
+  # kms:GenerateDataKey on that customer-managed key.
+  #
+  # Data classification, retention, and handling procedures are
+  # documented in docs/SECURITY.md ("Data Classification and Handling").
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref DashboardBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LoggingConfiguration:
+        DestinationBucketName: !Ref DashboardAccessLogBucket
+        LogFilePrefix: s3-access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldCacheVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Enforce TLS for all requests.
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt DashboardBucket.Arn
+              - !Sub '${DashboardBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          # Scope PutObject on Lambda deployment prefixes to the deploy
+          # principal only, to prevent supply-chain tampering via a broadly
+          # permissive bucket policy.
+          - !If
+            - HasDeployPrincipal
+            - Sid: ScopeLambdaPutsToDeployer
+              Effect: Deny
+              NotPrincipal:
+                AWS:
+                  - !Ref DeployPrincipalArn
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource:
+                - !Sub '${DashboardBucket.Arn}/lambda/*'
+                - !Sub '${DashboardBucket.Arn}/frontend/*'
+            - !Ref AWS::NoValue
+
+Outputs:
+  DashboardBucketName:
+    Description: Dashboard bucket name
+    Value: !Ref DashboardBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardBucketName'
+
+  DashboardBucketArn:
+    Description: Dashboard bucket ARN
+    Value: !GetAtt DashboardBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardBucketArn'
+
+  DashboardAccessLogBucketName:
+    Description: Bucket receiving server access logs from the Dashboard bucket
+    Value: !Ref DashboardAccessLogBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardAccessLogBucketName'

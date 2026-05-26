@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "security-scanner": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/aws-samples/sample-mcp-security-scanner.git@main",
+        "security_scanner_mcp_server"
+      ],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "awslabs.aws-iac-mcp-server": {
+      "command": "uvx",
+      "args": [
+        "awslabs.aws-iac-mcp-server@latest"
+      ],
+      "env": {
+        "AWS_PROFILE": "default",
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
