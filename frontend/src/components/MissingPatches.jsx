@@ -32,6 +32,7 @@ import Container from '@cloudscape-design/components/container';
 import Select from '@cloudscape-design/components/select';
 
 import { fetchPatchesIndex } from '../api/compliance';
+import { exportToCSV, escapeCSVValue } from '../utils/formatters';
 import PatchesTable from './tables/PatchesTable';
 import PatchModal from './PatchModal';
 
@@ -74,8 +75,32 @@ export default function MissingPatches() {
   };
 
   const handleDownloadReport = () => {
-    // Download report functionality - to be implemented in later task
-    console.log('Download report clicked');
+    if (!filteredPatches || filteredPatches.length === 0) {
+      return;
+    }
+
+    const csvData = filteredPatches.map(patch => ({
+      'Patch ID': patch.patchId || '',
+      'Title': patch.title || '',
+      'Severity': patch.severity || '',
+      'Classification': patch.classification || '',
+      'Platform': patch.platform || '',
+      'Affected Instances': patch.affectedCount || 0,
+      'Instance IDs': (patch.instances || []).map(i => i.instanceId).join(', '),
+    }));
+
+    const columns = [
+      'Patch ID',
+      'Title',
+      'Severity',
+      'Classification',
+      'Platform',
+      'Affected Instances',
+      'Instance IDs',
+    ];
+
+    const filename = `missing-patches-${accountId}-${region}`;
+    exportToCSV(csvData, filename, columns);
   };
 
   // Handle patch row click to open detail modal
