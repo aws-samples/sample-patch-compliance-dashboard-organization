@@ -4,7 +4,10 @@
 
 A serverless dashboard for visualizing patch compliance across multiple AWS accounts and regions. Built on AWS Systems Manager Resource Data Sync data, it provides a centralized view of patch status for thousands of EC2 instances.
 
+## Overview: 
 ![Dashboard Screenshot](docs/images/Dashboard-screenshot.png)
+## Per account details : 
+![Per Account details](docs/images/account-details.png)
 
 ## Contents
 
