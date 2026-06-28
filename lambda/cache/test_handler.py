@@ -40,6 +40,7 @@ from handler import (
     aggregate_summary,
     build_detail_cache,
     build_patches_index,
+    write_account_patches,
 )
 
 
@@ -2311,6 +2312,126 @@ def test_cache_completeness_structured_multi_account_multi_region(num_accounts, 
 
 
 # =============================================================================
+# Unit Tests for write_account_patches
+# =============================================================================
+
+
+class TestWriteAccountPatches:
+    """Unit tests for write_account_patches.
+
+    The function aggregates per-account/region instances via
+    build_patches_index, decorates the result with self-describing
+    accountId/region/generatedAt, sorts patches by affectedCount
+    descending, and writes to cache/patches/{accountId}/{region}.json.
+    """
+
+    def _stub_s3(self):
+        """Replace handler.s3 with a MagicMock that records put_object calls."""
+        import handler as cache_handler
+        original_s3 = cache_handler.s3
+        original_bucket = cache_handler.DASHBOARD_BUCKET
+        cache_handler.s3 = MagicMock()
+        cache_handler.DASHBOARD_BUCKET = 'test-dashboard'
+        return cache_handler, original_s3, original_bucket
+
+    def _restore(self, cache_handler, original_s3, original_bucket):
+        cache_handler.s3 = original_s3
+        cache_handler.DASHBOARD_BUCKET = original_bucket
+
+    def test_writes_to_per_account_region_key(self):
+        """Should write to cache/patches/{accountId}/{region}.json."""
+        cache_handler, original_s3, original_bucket = self._stub_s3()
+        try:
+            write_account_patches('123456789012', 'us-east-1', [], '2024-01-15T10:30:00Z')
+
+            cache_handler.s3.put_object.assert_called_once()
+            call_kwargs = cache_handler.s3.put_object.call_args.kwargs
+            assert call_kwargs['Bucket'] == 'test-dashboard'
+            assert call_kwargs['Key'] == 'cache/patches/123456789012/us-east-1.json'
+            assert call_kwargs['ContentType'] == 'application/json'
+        finally:
+            self._restore(cache_handler, original_s3, original_bucket)
+
+    def test_writes_empty_body_for_no_instances(self):
+        """Should write {totalPatches:0, patches:[]} for empty input.
+
+        Always-write semantics let the API Lambda return 200 + empty
+        patches for a fully-patched account/region instead of 503.
+        """
+        cache_handler, original_s3, original_bucket = self._stub_s3()
+        try:
+            write_account_patches('123456789012', 'us-east-1', [], '2024-01-15T10:30:00Z')
+
+            body = json.loads(cache_handler.s3.put_object.call_args.kwargs['Body'])
+            assert body['totalPatches'] == 0
+            assert body['patches'] == []
+            assert body['accountId'] == '123456789012'
+            assert body['region'] == 'us-east-1'
+            assert body['generatedAt'] == '2024-01-15T10:30:00Z'
+        finally:
+            self._restore(cache_handler, original_s3, original_bucket)
+
+    def test_decorates_with_account_region_generated_at(self):
+        """Should overlay accountId/region/generatedAt on the body."""
+        cache_handler, original_s3, original_bucket = self._stub_s3()
+        try:
+            instances = [{
+                'instanceId': 'i-001',
+                'computerName': 'web-01',
+                'accountId': '123456789012',
+                'region': 'us-east-1',
+                'platform': 'Linux',
+                'instanceStatus': 'Active',
+                'missingPatches': [
+                    {'patchId': 'kernel.x86_64', 'title': 'kernel', 'severity': 'Critical', 'classification': 'Security'},
+                ],
+            }]
+            write_account_patches('123456789012', 'us-east-1', instances, '2024-01-15T10:30:00Z')
+
+            body = json.loads(cache_handler.s3.put_object.call_args.kwargs['Body'])
+            assert body['accountId'] == '123456789012'
+            assert body['region'] == 'us-east-1'
+            assert body['generatedAt'] == '2024-01-15T10:30:00Z'
+            assert body['totalPatches'] == 1
+            assert body['patches'][0]['patchId'] == 'kernel.x86_64'
+            assert body['patches'][0]['affectedCount'] == 1
+            assert body['patches'][0]['instances'][0]['instanceStatus'] == 'Active'
+        finally:
+            self._restore(cache_handler, original_s3, original_bucket)
+
+    def test_sorts_patches_by_affected_count_descending(self):
+        """Patches should be returned in affectedCount-desc order so the UI
+        surfaces the most impactful patches first."""
+        cache_handler, original_s3, original_bucket = self._stub_s3()
+        try:
+            instances = [
+                {
+                    'instanceId': f'i-{i:03d}', 'computerName': f'host-{i}',
+                    'accountId': '123456789012', 'region': 'us-east-1',
+                    'platform': 'Linux', 'instanceStatus': 'Active',
+                    'missingPatches': [
+                        # patch-a missing on every instance
+                        {'patchId': 'patch-a', 'title': 'A', 'severity': 'Critical', 'classification': 'Security'},
+                    ],
+                }
+                for i in range(5)
+            ]
+            # patch-b missing on only one instance
+            instances[0]['missingPatches'].append(
+                {'patchId': 'patch-b', 'title': 'B', 'severity': 'Low', 'classification': 'Bugfix'}
+            )
+            write_account_patches('123456789012', 'us-east-1', instances, '2024-01-15T10:30:00Z')
+
+            body = json.loads(cache_handler.s3.put_object.call_args.kwargs['Body'])
+            patch_ids_in_order = [p['patchId'] for p in body['patches']]
+            assert patch_ids_in_order == ['patch-a', 'patch-b']
+            assert body['patches'][0]['affectedCount'] == 5
+            assert body['patches'][1]['affectedCount'] == 1
+        finally:
+            self._restore(cache_handler, original_s3, original_bucket)
+
+
+# =============================================================================
 # Unit Tests for Cache Writing with Retry Logic
 # =============================================================================
 
@@ -2821,15 +2942,13 @@ class TestHandler:
                     'securityMissing': 0,
                     'lastScanTime': '2024-01-15 10:30 UTC',
                 },
-                'instances_for_index': [],
             }
         
         with patch.dict(os.environ, env_vars, clear=True):
             with patch('handler.discover_account_regions', side_effect=mock_discover):
                 with patch('handler.process_account_region', side_effect=mock_process):
                     with patch('handler.write_summary_cache'):
-                        with patch('handler.write_patches_index'):
-                            result = handler({}, None)
+                        result = handler({}, None)
         
         assert result['statusCode'] == 200
         body = json.loads(result['body'])
@@ -2887,15 +3006,13 @@ class TestHandler:
                     'securityMissing': 0,
                     'lastScanTime': '2024-01-15 10:00 UTC',
                 },
-                'instances_for_index': [],
             }
         
         with patch.dict(os.environ, env_vars, clear=True):
             with patch('handler.discover_account_regions', side_effect=mock_discover):
                 with patch('handler.process_account_region', side_effect=mock_process):
                     with patch('handler.write_summary_cache'):
-                        with patch('handler.write_patches_index'):
-                            result = handler({}, None)
+                        result = handler({}, None)
         
         assert result['statusCode'] == 200
         body = json.loads(result['body'])

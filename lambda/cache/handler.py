@@ -492,6 +492,7 @@ def build_patches_index(instances: list[dict]) -> dict:
                 'instanceName': instance_name,
                 'accountId': account_id,
                 'region': region,
+                'instanceStatus': instance.get('instanceStatus', 'Unknown'),
             })
     
     patches_list = []
@@ -661,26 +662,21 @@ def handler(event, context):
         # Step 2: Process each account/region
         generated_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         summaries = []
-        all_instances_for_patches_index = []
-        
+
         for idx, (account_id, region) in enumerate(account_regions, 1):
             print(f"[{idx}/{len(account_regions)}] Processing {account_id}/{region}", flush=True)
             try:
                 result = process_account_region(account_id, region, generated_at)
                 if result:
                     summaries.append(result['summary'])
-                    all_instances_for_patches_index.extend(result['instances_for_index'])
             except Exception as e:
                 logger.error(f"Error processing {account_id}/{region}: {e}", exc_info=True)
-        
-        # Step 3: Write summary cache
+
+        # Step 3: Write summary cache. Per-account/region patches caches
+        # were already written inline by process_account_region above.
         print(f"Writing summary cache with {len(summaries)} account/regions", flush=True)
         write_summary_cache(summaries, generated_at)
-        
-        # Step 4: Write patches index
-        print(f"Building patches index from {len(all_instances_for_patches_index)} instances", flush=True)
-        write_patches_index(all_instances_for_patches_index, generated_at)
-        
+
         print(f"Cache refresh complete: {len(summaries)} account/regions processed", flush=True)
         
         return {
@@ -943,10 +939,17 @@ def process_account_region(account_id, region, generated_at):
     
     summary['patchTypesLinux'] = patch_types_linux
     summary['patchTypesWindows'] = patch_types_windows
-    
-    # Prepare instances for patches index (all non-compliant instances with patches)
-    # Include instanceStatus so frontend can filter by Active/Terminated
-    instances_for_index = [
+
+    # Build and write the per-account/region patches cache.
+    # Previously the cache lambda accumulated every instance across every
+    # account/region and wrote one org-wide cache/patches-index.json. That
+    # file grew unboundedly with org size and tripped the ALB -> Lambda 1 MB
+    # response cap (HTTP 502 on /api/patches-index). The Missing Patches
+    # page already operates on a single account/region at a time, so the
+    # cache is now sharded to match: one file per account/region, written
+    # here inside process_account_region so the slim projection never
+    # leaves this function.
+    instances_for_patches = [
         {
             'instanceId': i['instanceId'],
             'computerName': i['computerName'],
@@ -958,10 +961,10 @@ def process_account_region(account_id, region, generated_at):
         }
         for i in all_instances if i['missingPatches']
     ]
-    
+    write_account_patches(account_id, region, instances_for_patches, generated_at)
+
     return {
         'summary': summary,
-        'instances_for_index': instances_for_index,
     }
 
 
@@ -1252,6 +1255,38 @@ def write_summary_cache(summaries, generated_at):
     )
 
 
+def write_account_patches(account_id, region, instances, generated_at):
+    """Build and write the per-account/region patches cache file.
+
+    Aggregates `instances` (which must already be scoped to the given
+    account/region and slimmed to the patches-view projection) into a
+    patches-centric view and writes it to
+    cache/patches/{accountId}/{region}.json.
+
+    Always writes the file, even when `instances` is empty, so the API
+    Lambda returns 200 + empty patches rather than 503 for a
+    fully-patched account/region.
+    """
+    patches_data = build_patches_index(instances)
+    # build_patches_index returns patches in insertion order; the UI
+    # expects them sorted by affectedCount descending so the most
+    # impactful patches surface first when the table loads.
+    patches_data['patches'].sort(key=lambda x: x.get('affectedCount', 0), reverse=True)
+    patches_data['generatedAt'] = generated_at
+    patches_data['accountId'] = account_id
+    patches_data['region'] = region
+
+    key = f'cache/patches/{account_id}/{region}.json'
+    s3.put_object(
+        Bucket=DASHBOARD_BUCKET,
+        Key=key,
+        Body=json.dumps(patches_data),
+        ContentType='application/json',
+    )
+
+    print(f"  Wrote patches cache: {key} ({patches_data['totalPatches']} unique patches)", flush=True)
+
+
 def write_patches_index(instances, generated_at):
     """Build and write the patches-index.json cache file."""
     patches_map = defaultdict(lambda: {
@@ -1329,24 +1364,10 @@ def write_empty_caches():
             'patchTypesWindows': {'Critical': 0, 'Security': 0, 'Other': 0},
         },
     }
-    
-    empty_patches = {
-        'generatedAt': generated_at,
-        'totalPatches': 0,
-        'patches': [],
-    }
-    
     s3.put_object(
         Bucket=DASHBOARD_BUCKET,
         Key='cache/compliance-summary.json',
         Body=json.dumps(empty_summary),
-        ContentType='application/json'
-    )
-    
-    s3.put_object(
-        Bucket=DASHBOARD_BUCKET,
-        Key='cache/patches-index.json',
-        Body=json.dumps(empty_patches),
         ContentType='application/json'
     )
 
