@@ -207,13 +207,17 @@ Path: `cache/detail/{accountId}/{region}/`
 }
 ```
 
-### Patches Index (`cache/patches-index.json`)
+### Patches Cache (`cache/patches/{accountId}/{region}.json`)
 
-The patches index includes ALL instances (Active and Terminated) with missing patches. The frontend filters by instanceStatus to show Active-only, Terminated-only, or All.
+The patches cache is sharded per account/region. Each file holds only the patches affecting instances in that scope, which keeps every response under the ALB → Lambda 1 MB cap regardless of org size. The Cache Lambda writes one file per account/region it processes, even when the account has zero missing patches, so the API Lambda returns `200` with an empty `patches` array for a fully-patched account rather than `503`.
+
+Includes ALL instances (Active and Terminated) with missing patches. The frontend filters by `instanceStatus` to show Active-only, Terminated-only, or All — that filter stays client-side so toggling is instant and does not re-fetch.
 
 ```json
 {
   "generatedAt": "ISO 8601 timestamp",
+  "accountId": "123456789012",
+  "region": "us-east-1",
   "totalPatches": 50,
   "patches": [
     {
@@ -240,3 +244,7 @@ The patches index includes ALL instances (Active and Terminated) with missing pa
 **Important**: The `instanceStatus` field in each instance entry enables frontend filtering:
 - `"Active"` - Instance is currently running
 - `"Terminated"` - Instance has been terminated (data retained for 30 days by Resource Data Sync)
+
+`patches` are sorted by `affectedCount` descending so the most impactful patches load first.
+
+Every `instances[].accountId` matches the top-level `accountId` and every `instances[].region` matches the top-level `region` — the fields are redundant in this layout (kept for response self-description; older clients that filtered on them keep working).

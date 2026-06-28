@@ -15,29 +15,29 @@ Rationale: Patches pending reboot represent a real compliance gap — the vulner
 ## Instance Filtering
 - **Summary/Aggregations** (the home page totals, the per-account row counts in the accounts table, and the `cache/compliance-summary.json` entries written by `process_account_region`): only count instances where `InstanceStatus == "Active"`. The home page is "things to manage today"; counting 30 days of terminated history would inflate headline totals and skew the compliance percentage. The detail cache (`cache/detail/...`) still receives every instance — only the rolled-up summary filters.
 - **Detail Views**: include ALL instances (Active, Terminated, Unknown) with a filter dropdown, defaulting to "Active Only"
-- **Missing Patches Page**: include ALL instances in patches index, filter by status in frontend with dropdown (Active Only, Terminated Only, All Status)
+- **Missing Patches Page**: include ALL instances in the per-account/region patches cache, filter by status in frontend with dropdown (Active Only, Terminated Only, All Status)
 
-## Patches Index Filtering
-The patches index includes all non-compliant instances (Active and Terminated) so users can:
+## Patches Cache Filtering
+The `/api/patches?accountId=X&region=Y` endpoint already scopes the response to one account/region (one file in `cache/patches/{accountId}/{region}.json`), so no client-side account/region filter is needed.
+
+Each patch's `instances` array includes both Active and Terminated instances within that scope so users can:
 1. View patches affecting Active instances (default view)
 2. View patches that were missing on Terminated instances (for historical analysis)
 3. View all patches regardless of instance status
 
 Frontend filtering logic:
 ```javascript
-// Filter patches by account/region and instance status
+// Filter patches by instance status. The endpoint is already scoped to
+// the account/region from the URL, so no inst.accountId / inst.region
+// check is needed here.
 const filteredPatches = patchesData.patches
   .map(patch => {
     const filteredInstances = patch.instances.filter(inst => {
-      // Must match account and region from URL
-      if (inst.accountId !== accountId || inst.region !== region) return false;
-      
-      // Apply status filter
       if (statusFilter === 'active') return inst.instanceStatus === 'Active';
       if (statusFilter === 'terminated') return inst.instanceStatus === 'Terminated';
       return true; // 'all' - include all
     });
-    
+
     if (filteredInstances.length === 0) return null;
     return { ...patch, instances: filteredInstances, affectedCount: filteredInstances.length };
   })

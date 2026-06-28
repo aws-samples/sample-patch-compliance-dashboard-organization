@@ -175,7 +175,7 @@ All three Lambdas run in the Amazon VPC (per `security.md` baseline). Cache Lamb
 - **Routes**:
   - `GET /api/compliance-summary` → Read from summary cache
   - `GET /api/compliance-detail?accountId=X&region=Y` → Read from detail cache
-  - `GET /api/patches-index` → Read from patches index cache
+  - `GET /api/patches?accountId=X&region=Y` → Read from per-account/region patches cache
 
 ### Frontend Lambda
 - **Timeout**: 30 seconds
