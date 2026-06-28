@@ -22,7 +22,7 @@ Amazon S3 Dashboard bucket and returns them to the frontend.
 Endpoints:
 - GET /api/compliance-summary: Returns the summary cache
 - GET /api/compliance-detail?accountId=X&region=Y: Returns detail cache for account/region
-- GET /api/patches-index: Returns the patches index cache
+- GET /api/patches?accountId=X&region=Y: Returns the per-account/region patches cache
 
 Required IAM permissions: s3:GetObject on
 arn:aws:s3:::${DashboardBucket}/cache/* (read-only access to cache
@@ -341,31 +341,40 @@ def _get_detail_from_chunks(bucket: str, account_id: str, region: str,
     return result
 
 
-def get_patches_index() -> dict:
-    """Read and return cache/patches-index.json.
-    
-    Reads the patches index cache file from the Dashboard bucket and returns
-    its contents as a dictionary.
-    
+def get_patches(account_id: str, region: str) -> dict:
+    """Read and return cache/patches/{accountId}/{region}.json.
+
+    Reads the per-account/region patches cache written by the Cache
+    Lambda's write_account_patches function and returns its contents.
+
+    Per architecture.md: the Cache Lambda always writes this file, even
+    when the account/region has zero missing patches. A genuine
+    CacheNotFoundError only fires when the Cache Lambda has never run
+    for this account/region (e.g., immediately after a fresh deploy).
+
+    Args:
+        account_id: AWS account ID
+        region: AWS region
+
     Returns:
-        Dictionary containing the patches index data
-        
+        Dictionary containing the patches data for this account/region
+
     Raises:
         CacheNotFoundError: If the cache file does not exist or cannot be read
     """
     bucket = DASHBOARD_BUCKET
-    key = 'cache/patches-index.json'
-    
+    key = f'cache/patches/{account_id}/{region}.json'
+
     content = read_s3_file(bucket, key)
-    
+
     if content is None:
-        logger.warning(f"Patches index cache not found: bucket={bucket}, key={key}")
+        logger.warning(f"Patches cache not found: bucket={bucket}, key={key}")
         raise CacheNotFoundError()
-    
+
     try:
         return json.loads(content)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse patches index cache JSON: {e}")
+        logger.error(f"Failed to parse patches cache JSON: {e}")
         raise CacheNotFoundError("Cache data is corrupted, please wait for refresh")
 
 
@@ -398,7 +407,7 @@ def handler(event, context):
     Supported routes:
     - GET /api/compliance-summary: Returns summary cache
     - GET /api/compliance-detail?accountId=X&region=Y: Returns detail cache
-    - GET /api/patches-index: Returns patches index cache
+    - GET /api/patches?accountId=X&region=Y: Returns per-account/region patches cache
     
     Args:
         event: ALB request event containing:
@@ -462,8 +471,25 @@ def handler(event, context):
             data = get_compliance_detail(account_id, region, page, page_size, instance_id)
             return create_success_response(data)
         
-        elif path == '/api/patches-index':
-            data = get_patches_index()
+        elif path == '/api/patches':
+            # Per-account/region patches cache (replaces /api/patches-index
+            # which returned an org-wide blob that exceeded the ALB 1 MB
+            # response cap at scale).
+            account_id = query_params.get('accountId')
+            region = query_params.get('region')
+
+            if not account_id:
+                raise ValidationError("Missing required parameter: accountId")
+            if not region:
+                raise ValidationError("Missing required parameter: region")
+
+            # Regex validation — same patterns as /api/compliance-detail.
+            if not _ACCOUNT_ID_RE.match(account_id):
+                raise ValidationError("Invalid accountId format: expected 12-digit AWS account ID")
+            if not _REGION_RE.match(region):
+                raise ValidationError("Invalid region format: expected AWS region like us-east-1")
+
+            data = get_patches(account_id, region)
             return create_success_response(data)
         
         else:
