@@ -109,7 +109,7 @@ describe('MissingPatches', () => {
 
   describe('Page Header', () => {
     it('displays "Missing Patches" title', async () => {
-      complianceApi.fetchPatchesIndex.mockResolvedValue(mockPatchesData);
+      complianceApi.fetchPatches.mockResolvedValue(mockPatchesData);
       renderWithRouter();
       
       await waitFor(() => {
@@ -122,7 +122,7 @@ describe('MissingPatches', () => {
     });
 
     it('displays account/region description', async () => {
-      complianceApi.fetchPatchesIndex.mockResolvedValue(mockPatchesData);
+      complianceApi.fetchPatches.mockResolvedValue(mockPatchesData);
       renderWithRouter('123456789012', 'us-west-2');
       
       await waitFor(() => {
@@ -131,7 +131,7 @@ describe('MissingPatches', () => {
     });
 
     it('displays Back to Account button', async () => {
-      complianceApi.fetchPatchesIndex.mockResolvedValue(mockPatchesData);
+      complianceApi.fetchPatches.mockResolvedValue(mockPatchesData);
       renderWithRouter();
       
       await waitFor(() => {
@@ -140,7 +140,7 @@ describe('MissingPatches', () => {
     });
 
     it('displays Download Report button', async () => {
-      complianceApi.fetchPatchesIndex.mockResolvedValue(mockPatchesData);
+      complianceApi.fetchPatches.mockResolvedValue(mockPatchesData);
       renderWithRouter();
       
       await waitFor(() => {
@@ -151,7 +151,7 @@ describe('MissingPatches', () => {
 
   describe('Stats Summary', () => {
     it('displays unique patches count', async () => {
-      complianceApi.fetchPatchesIndex.mockResolvedValue(mockPatchesData);
+      complianceApi.fetchPatches.mockResolvedValue(mockPatchesData);
       renderWithRouter();
       
       await waitFor(() => {
@@ -163,7 +163,7 @@ describe('MissingPatches', () => {
     });
 
     it('displays critical count', async () => {
-      complianceApi.fetchPatchesIndex.mockResolvedValue(mockPatchesData);
+      complianceApi.fetchPatches.mockResolvedValue(mockPatchesData);
       renderWithRouter();
       
       await waitFor(() => {
@@ -174,7 +174,7 @@ describe('MissingPatches', () => {
     });
 
     it('displays important/high count', async () => {
-      complianceApi.fetchPatchesIndex.mockResolvedValue(mockPatchesData);
+      complianceApi.fetchPatches.mockResolvedValue(mockPatchesData);
       renderWithRouter();
       
       await waitFor(() => {
@@ -183,7 +183,7 @@ describe('MissingPatches', () => {
     });
 
     it('handles empty patches data', async () => {
-      complianceApi.fetchPatchesIndex.mockResolvedValue({
+      complianceApi.fetchPatches.mockResolvedValue({
         generatedAt: '2024-01-15T10:30:00Z',
         totalPatches: 0,
         patches: []
@@ -200,7 +200,7 @@ describe('MissingPatches', () => {
 
   describe('Loading State', () => {
     it('displays loading spinner while fetching data', () => {
-      complianceApi.fetchPatchesIndex.mockImplementation(() => new Promise(() => {}));
+      complianceApi.fetchPatches.mockImplementation(() => new Promise(() => {}));
       renderWithRouter();
       
       expect(screen.getByText(/Loading patches data/i)).toBeInTheDocument();
@@ -209,7 +209,7 @@ describe('MissingPatches', () => {
 
   describe('Error State', () => {
     it('displays error message when API fails', async () => {
-      complianceApi.fetchPatchesIndex.mockRejectedValue(new Error('Network error'));
+      complianceApi.fetchPatches.mockRejectedValue(new Error('Network error'));
       renderWithRouter();
       
       await waitFor(() => {
@@ -219,7 +219,7 @@ describe('MissingPatches', () => {
     });
 
     it('displays refresh button on error', async () => {
-      complianceApi.fetchPatchesIndex.mockRejectedValue(new Error('Network error'));
+      complianceApi.fetchPatches.mockRejectedValue(new Error('Network error'));
       renderWithRouter();
       
       await waitFor(() => {
@@ -238,7 +238,7 @@ describe('MissingPatches', () => {
           { ...mockPatchesData.patches[2], severity: 'Critical', instances: [{ instanceId: 'i-003', accountId: '123456789012', region: 'us-east-1', instanceStatus: 'Active' }] }
         ]
       };
-      complianceApi.fetchPatchesIndex.mockResolvedValue(mixedCaseData);
+      complianceApi.fetchPatches.mockResolvedValue(mixedCaseData);
       renderWithRouter();
       
       await waitFor(() => {
@@ -262,7 +262,7 @@ describe('MissingPatches', () => {
           { patchId: '4', severity: 'important', instances: [{ instanceId: 'i-004', accountId: '123456789012', region: 'us-east-1', instanceStatus: 'Active' }] }
         ]
       };
-      complianceApi.fetchPatchesIndex.mockResolvedValue(importantHighData);
+      complianceApi.fetchPatches.mockResolvedValue(importantHighData);
       renderWithRouter();
       
       await waitFor(() => {

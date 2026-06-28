@@ -19,7 +19,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   fetchComplianceSummary,
   fetchComplianceDetail,
-  fetchPatchesIndex,
+  fetchPatches,
   ApiError
 } from '../compliance.js';
 
@@ -224,10 +224,12 @@ describe('API Client - compliance.js', () => {
     });
   });
 
-  describe('fetchPatchesIndex', () => {
+  describe('fetchPatches', () => {
     it('should return patches data on successful response', async () => {
       const mockData = {
         generatedAt: '2024-01-15T10:30:00Z',
+        accountId: '123456789012',
+        region: 'us-east-1',
         totalPatches: 50,
         patches: []
       };
@@ -237,10 +239,49 @@ describe('API Client - compliance.js', () => {
         json: () => Promise.resolve(mockData)
       });
 
-      const result = await fetchPatchesIndex();
-      
+      const result = await fetchPatches('123456789012', 'us-east-1');
+
       expect(result).toEqual(mockData);
-      expect(global.fetch).toHaveBeenCalledWith('/api/patches-index');
+      expect(global.fetch).toHaveBeenCalledWith(
+        '/api/patches?accountId=123456789012&region=us-east-1'
+      );
+    });
+
+    it('should URL encode accountId and region parameters', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ patches: [] })
+      });
+
+      await fetchPatches('123/456', 'us-east-1');
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        '/api/patches?accountId=123%2F456&region=us-east-1'
+      );
+    });
+
+    it('should throw ApiError when accountId is missing', async () => {
+      await expect(fetchPatches(null, 'us-east-1')).rejects.toThrow(ApiError);
+      await expect(fetchPatches(null, 'us-east-1')).rejects.toMatchObject({
+        statusCode: 400,
+        message: expect.stringContaining('accountId')
+      });
+    });
+
+    it('should throw ApiError when region is missing', async () => {
+      await expect(fetchPatches('123456789012', null)).rejects.toThrow(ApiError);
+      await expect(fetchPatches('123456789012', null)).rejects.toMatchObject({
+        statusCode: 400,
+        message: expect.stringContaining('region')
+      });
+    });
+
+    it('should throw ApiError when accountId is empty string', async () => {
+      await expect(fetchPatches('', 'us-east-1')).rejects.toThrow(ApiError);
+    });
+
+    it('should throw ApiError when region is empty string', async () => {
+      await expect(fetchPatches('123456789012', '')).rejects.toThrow(ApiError);
     });
 
     it('should throw ApiError with 503 status when cache not available', async () => {
@@ -251,10 +292,10 @@ describe('API Client - compliance.js', () => {
         json: () => Promise.resolve({ error: 'Cache not available' })
       });
 
-      await expect(fetchPatchesIndex()).rejects.toThrow(ApiError);
-      await expect(fetchPatchesIndex()).rejects.toMatchObject({
+      await expect(fetchPatches('123456789012', 'us-east-1')).rejects.toThrow(ApiError);
+      await expect(fetchPatches('123456789012', 'us-east-1')).rejects.toMatchObject({
         statusCode: 503,
-        endpoint: 'patches-index'
+        endpoint: 'patches'
       });
     });
 
@@ -266,14 +307,14 @@ describe('API Client - compliance.js', () => {
         json: () => Promise.resolve({ error: 'Internal server error' })
       });
 
-      await expect(fetchPatchesIndex()).rejects.toThrow(ApiError);
+      await expect(fetchPatches('123456789012', 'us-east-1')).rejects.toThrow(ApiError);
     });
 
     it('should throw ApiError on network failure', async () => {
       global.fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
 
-      await expect(fetchPatchesIndex()).rejects.toThrow(ApiError);
-      await expect(fetchPatchesIndex()).rejects.toMatchObject({
+      await expect(fetchPatches('123456789012', 'us-east-1')).rejects.toThrow(ApiError);
+      await expect(fetchPatches('123456789012', 'us-east-1')).rejects.toMatchObject({
         statusCode: 0,
         message: expect.stringContaining('Unable to connect')
       });

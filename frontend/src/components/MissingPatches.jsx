@@ -31,7 +31,7 @@ import ColumnLayout from '@cloudscape-design/components/column-layout';
 import Container from '@cloudscape-design/components/container';
 import Select from '@cloudscape-design/components/select';
 
-import { fetchPatchesIndex } from '../api/compliance';
+import { fetchPatches } from '../api/compliance';
 import { exportToCSV, escapeCSVValue } from '../utils/formatters';
 import PatchesTable from './tables/PatchesTable';
 import PatchModal from './PatchModal';
@@ -61,7 +61,9 @@ export default function MissingPatches() {
     setLoading(true);
     setError(null);
     try {
-      const data = await fetchPatchesIndex();
+      // Scoped fetch: the backend returns patches for this account/region
+      // only. No client-side account/region filtering needed below.
+      const data = await fetchPatches(accountId, region);
       setPatchesData(data);
     } catch (err) {
       setError(err.message || 'Failed to load patches data');
@@ -113,20 +115,16 @@ export default function MissingPatches() {
     setSelectedPatch(null);
   };
 
-  // Filter patches to only show those affecting this account/region with status filter
+  // Apply the status filter (Active / Terminated / All). The endpoint
+  // already returns patches scoped to this account/region, so no
+  // account/region filtering is needed here — that legacy filter was
+  // a workaround for the old org-wide /api/patches-index response.
   const filteredPatches = useMemo(() => {
     if (!patchesData?.patches) return [];
-    
+
     return patchesData.patches
       .map(patch => {
-        // Filter instances to only those in this account/region with matching status
         const filteredInstances = (patch.instances || []).filter(inst => {
-          // Must match account and region
-          if (inst.accountId !== accountId || inst.region !== region) {
-            return false;
-          }
-          
-          // Apply status filter
           const instStatus = inst.instanceStatus || 'Unknown';
           if (statusFilter.value === 'active') {
             return instStatus === 'Active';
@@ -136,18 +134,18 @@ export default function MissingPatches() {
           // 'all' - include all statuses
           return true;
         });
-        
-        // Only include patch if it has instances matching the filter
+
+        // Drop patches that have no instances matching the status filter
         if (filteredInstances.length === 0) return null;
-        
+
         return {
           ...patch,
           instances: filteredInstances,
           affectedCount: filteredInstances.length
         };
       })
-      .filter(Boolean); // Remove null entries
-  }, [patchesData, accountId, region, statusFilter]);
+      .filter(Boolean);
+  }, [patchesData, statusFilter]);
 
   // Calculate stats from filtered patches data
   const stats = useMemo(() => {

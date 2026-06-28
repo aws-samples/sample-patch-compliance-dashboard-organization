@@ -134,23 +134,38 @@ export async function fetchComplianceDetail(accountId, region, options = {}) {
 }
 
 /**
- * Fetch patches index data from the API
- * @returns {Promise<Object>} Patches index data with unique patches and affected instance counts
- * @throws {ApiError} When API request fails
+ * Fetch missing patches scoped to a specific account/region from the API.
+ *
+ * Replaces the legacy fetchPatchesIndex() which returned the org-wide
+ * patches blob. The backend now serves a per-account/region patches
+ * cache so the response stays under the ALB 1 MB response cap at any
+ * realistic org size.
+ *
+ * @param {string} accountId - AWS account ID
+ * @param {string} region - AWS region
+ * @returns {Promise<Object>} Patches data scoped to the given account/region
+ * @throws {ApiError} When API request fails or required params are missing
  */
-export async function fetchPatchesIndex() {
+export async function fetchPatches(accountId, region) {
+  if (!accountId) {
+    throw new ApiError('Missing required parameter: accountId', 400, 'patches');
+  }
+  if (!region) {
+    throw new ApiError('Missing required parameter: region', 400, 'patches');
+  }
+
   try {
-    const response = await fetch('/api/patches-index');
-    return handleResponse(response, 'patches-index');
+    const url = `/api/patches?accountId=${encodeURIComponent(accountId)}&region=${encodeURIComponent(region)}`;
+    const response = await fetch(url);
+    return handleResponse(response, 'patches');
   } catch (error) {
     if (error instanceof ApiError) {
       throw error;
     }
-    // Handle network errors
     throw new ApiError(
       'Unable to connect to server. Check your network connection.',
       0,
-      'patches-index'
+      'patches'
     );
   }
 }
