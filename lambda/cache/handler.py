@@ -259,6 +259,58 @@ def detect_platform(platform_type: str, platform_name: str) -> str:
     return 'Unknown'
 
 
+def derive_patch_platform(patch_id: str, fallback: str = 'Unknown') -> str:
+    """Derive a patch's platform from its patch ID.
+
+    Patch IDs are themselves strong evidence of the target platform:
+    RPM patches carry architecture suffixes like .x86_64 / .noarch /
+    .aarch64 (sometimes followed by NEVRA version metadata such as
+    `glibc-common.x86_64:0:2.26-64.amzn2.0.6`), and Microsoft KB
+    patches are prefixed `KB` followed by digits. We prefer this over
+    the instance's reported PlatformType because hybrid-activated
+    managed instances and custom AMIs often register with an empty or
+    "Unknown" PlatformType, which would otherwise propagate to every
+    patch entry in the cache.
+
+    Args:
+        patch_id: The patch identifier (e.g., 'kernel.x86_64',
+                  'glibc-common.x86_64:0:2.26-64.amzn2.0.6',
+                  'KB5037768').
+        fallback: Platform to return when the ID matches no known
+                  pattern. Callers typically pass the instance's
+                  reported platform so a real signal beats this
+                  heuristic when available.
+
+    Returns:
+        Platform string: "Linux", "Windows", or the supplied fallback.
+    """
+    if not patch_id:
+        return fallback
+
+    pid = patch_id.strip()
+    if not pid:
+        return fallback
+
+    # Linux RPM/DEB architecture tokens. RPM IDs look like
+    # `package.arch` and may optionally carry a NEVRA tail
+    # (`:epoch:version-release`), so match the arch as a `.arch`
+    # token anywhere in the string rather than only at the end.
+    linux_arch_tokens = (
+        r'\.x86_64\b', r'\.noarch\b', r'\.i686\b', r'\.aarch64\b',
+        r'\.amd64\b', r'\.arm64\b', r'\.src\b', r'\.deb\b',
+    )
+    if re.search('|'.join(linux_arch_tokens), pid):
+        return 'Linux'
+
+    # Microsoft KB articles. Windows servicing IDs sometimes prefix the
+    # KB with the OS (e.g. Windows10.0-KB5037768), so match anywhere in
+    # the string after a word boundary.
+    if re.search(r'\bKB\d{5,}\b', pid):
+        return 'Windows'
+
+    return fallback
+
+
 def aggregate_summary(instances: list[dict], datasync_bucket: str = '') -> dict:
     """Build compliance-summary.json structure from instance data.
     
@@ -485,7 +537,14 @@ def build_patches_index(instances: list[dict]) -> dict:
                 patches_map[patch_id]['title'] = title
                 patches_map[patch_id]['severity'] = severity
                 patches_map[patch_id]['classification'] = classification
-                patches_map[patch_id]['platform'] = platform
+                # Derive platform from the patch ID itself first, falling
+                # back to the instance's reported platform when the ID
+                # doesn't match a known pattern. This protects against
+                # instances that register with empty/"Unknown"
+                # PlatformType (hybrid-activated SSM agents, custom AMIs,
+                # newly-launched instances) and would otherwise paint
+                # every obviously-Linux RPM as Unknown in the UI.
+                patches_map[patch_id]['platform'] = derive_patch_platform(patch_id, fallback=platform)
             
             patches_map[patch_id]['instances'].append({
                 'instanceId': instance_id,

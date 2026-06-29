@@ -794,6 +794,93 @@ def test_platform_detection_whitespace_type_triggers_fallback(whitespace_type, p
 
 
 # =============================================================================
+# Unit Tests for Patch-ID -> Platform Inference
+# =============================================================================
+
+
+class TestDerivePatchPlatform:
+    """Unit tests for derive_patch_platform.
+
+    The function infers a patch's platform from its ID so the Missing
+    Patches table shows Linux/Windows even when the underlying
+    instance's PlatformType is empty or "Unknown" (which happens with
+    hybrid-activated managed instances, custom AMIs, and instances
+    that have not completed their first full inventory scan).
+    """
+
+    def test_linux_rpm_x86_64_suffix(self):
+        from handler import derive_patch_platform
+        assert derive_patch_platform('kernel.x86_64') == 'Linux'
+
+    def test_linux_rpm_noarch_suffix(self):
+        from handler import derive_patch_platform
+        assert derive_patch_platform('python-jwcrypto.noarch') == 'Linux'
+
+    def test_linux_rpm_aarch64_suffix(self):
+        from handler import derive_patch_platform
+        assert derive_patch_platform('kernel.aarch64') == 'Linux'
+
+    def test_linux_rpm_i686_suffix(self):
+        from handler import derive_patch_platform
+        assert derive_patch_platform('legacy-libs.i686') == 'Linux'
+
+    def test_linux_deb_suffix(self):
+        from handler import derive_patch_platform
+        assert derive_patch_platform('libssl1.1_1.1.1f-1ubuntu2.deb') == 'Linux'
+
+    def test_amazon_linux_2_patch(self):
+        """Real-world Amazon Linux 2 patch ID format with arch + distro suffix."""
+        from handler import derive_patch_platform
+        assert derive_patch_platform('glibc-common.x86_64:0:2.26-64.amzn2.0.6') == 'Linux'
+
+    def test_windows_kb_patch_simple(self):
+        from handler import derive_patch_platform
+        assert derive_patch_platform('KB5037768') == 'Windows'
+
+    def test_windows_kb_patch_with_os_prefix(self):
+        """Windows servicing IDs sometimes prefix the OS before the KB."""
+        from handler import derive_patch_platform
+        assert derive_patch_platform('Windows10.0-KB5037768') == 'Windows'
+
+    def test_unknown_patch_id_returns_fallback(self):
+        from handler import derive_patch_platform
+        # Default fallback
+        assert derive_patch_platform('mystery-patch-2024') == 'Unknown'
+        # Caller-supplied fallback wins when ID is uninformative
+        assert derive_patch_platform('mystery-patch-2024', fallback='Linux') == 'Linux'
+
+    def test_empty_patch_id_returns_fallback(self):
+        from handler import derive_patch_platform
+        assert derive_patch_platform('') == 'Unknown'
+        assert derive_patch_platform('   ') == 'Unknown'
+        assert derive_patch_platform(None) == 'Unknown'
+        assert derive_patch_platform('', fallback='Linux') == 'Linux'
+
+    def test_patch_id_inference_overrides_unknown_instance_platform(self):
+        """The bug we are fixing: an instance reports PlatformType="Unknown"
+        (or empty) yet the patch IDs are clearly Linux RPMs. The patches
+        index should label them Linux, not Unknown."""
+        from handler import build_patches_index
+
+        result = build_patches_index([{
+            'instanceId': 'i-001',
+            'computerName': 'web-01',
+            'accountId': '123456789012',
+            'region': 'us-east-1',
+            'platform': 'Unknown',  # SSM had no platform signal
+            'instanceStatus': 'Active',
+            'missingPatches': [
+                {'patchId': 'rsync.x86_64', 'title': 'rsync update', 'severity': 'Important', 'classification': 'Security'},
+                {'patchId': 'python-jwcrypto.noarch', 'title': 'jwcrypto', 'severity': 'Important', 'classification': 'Security'},
+            ],
+        }])
+
+        platforms = {p['patchId']: p['platform'] for p in result['patches']}
+        assert platforms['rsync.x86_64'] == 'Linux'
+        assert platforms['python-jwcrypto.noarch'] == 'Linux'
+
+
+# =============================================================================
 # Unit Tests for Summary Aggregation
 # =============================================================================
 
