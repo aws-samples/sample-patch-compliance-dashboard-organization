@@ -116,36 +116,95 @@ show_stack_failure_reason() {
 empty_versioned_bucket() {
     local BUCKET="$1"
     local REGION="$2"
-    
+
     if ! aws s3api head-bucket --bucket "${BUCKET}" --region "${REGION}" 2>/dev/null; then
         warn "Bucket not found (already deleted): ${BUCKET}"
         return 0
     fi
-    
+
     info "  Emptying bucket: ${BUCKET}"
-    
-    # Delete current and noncurrent versions
-    aws s3api list-object-versions --bucket "${BUCKET}" --region "${REGION}" \
-        --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json 2>/dev/null \
-        | python3 -c "import sys, json; d = json.load(sys.stdin); print(json.dumps({'Objects': d.get('Objects') or []}))" \
-        > /tmp/delete-versions.json
-    if [ -s /tmp/delete-versions.json ] && [ "$(jq '.Objects | length' /tmp/delete-versions.json 2>/dev/null || echo 0)" -gt 0 ]; then
-        aws s3api delete-objects --bucket "${BUCKET}" --region "${REGION}" --delete file:///tmp/delete-versions.json > /dev/null || true
+
+    # S3 DeleteObjects rejects payloads with more than 1000 entries or
+    # with an empty Objects array (returns MalformedXML in both cases).
+    # Versioned buckets can accumulate thousands of object versions
+    # across many cache-lambda runs, so we page through with
+    # --max-items 1000 and delete one batch at a time. We also check
+    # the exit status of every delete batch — silent failure here is
+    # what caused the "[SUCCESS] Emptied" + non-empty-bucket bug in
+    # earlier versions of this script.
+
+    local BATCH_FILE
+    BATCH_FILE="$(mktemp)"
+    local TOKEN=""
+    local BATCH_NUM=0
+
+    # Walk Versions and DeleteMarkers in the same loop. list-object-versions
+    # returns both arrays per page; we serialize them together so each
+    # delete-objects call carries up to 1000 entries.
+    while true; do
+        BATCH_NUM=$((BATCH_NUM + 1))
+
+        local PAGE_JSON
+        if [ -z "${TOKEN}" ]; then
+            PAGE_JSON=$(aws s3api list-object-versions \
+                --bucket "${BUCKET}" --region "${REGION}" \
+                --max-items 1000 --output json 2>/dev/null) || {
+                error "Failed to list object versions in ${BUCKET}"
+            }
+        else
+            PAGE_JSON=$(aws s3api list-object-versions \
+                --bucket "${BUCKET}" --region "${REGION}" \
+                --max-items 1000 --starting-token "${TOKEN}" \
+                --output json 2>/dev/null) || {
+                error "Failed to list object versions in ${BUCKET} (page ${BATCH_NUM})"
+            }
+        fi
+
+        # Build a single Objects array from this page's Versions +
+        # DeleteMarkers. Either may be missing/null on the page.
+        echo "${PAGE_JSON}" | python3 -c '
+import json, sys
+page = json.load(sys.stdin)
+versions = page.get("Versions") or []
+markers = page.get("DeleteMarkers") or []
+objs = [{"Key": v["Key"], "VersionId": v["VersionId"]} for v in versions]
+objs.extend({"Key": m["Key"], "VersionId": m["VersionId"]} for m in markers)
+print(json.dumps({"Objects": objs, "Quiet": True}))
+' > "${BATCH_FILE}"
+
+        local OBJ_COUNT
+        OBJ_COUNT=$(jq '.Objects | length' "${BATCH_FILE}" 2>/dev/null || echo 0)
+
+        # Only call DeleteObjects when there is something to delete —
+        # an empty Objects array is the other MalformedXML trigger.
+        if [ "${OBJ_COUNT}" -gt 0 ]; then
+            if ! aws s3api delete-objects \
+                --bucket "${BUCKET}" --region "${REGION}" \
+                --delete "file://${BATCH_FILE}" > /dev/null; then
+                rm -f "${BATCH_FILE}"
+                error "Failed to delete ${OBJ_COUNT} object versions in ${BUCKET} (page ${BATCH_NUM}). Re-run deploy.sh delete after fixing the underlying error."
+            fi
+        fi
+
+        TOKEN=$(echo "${PAGE_JSON}" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("NextToken") or "")')
+        if [ -z "${TOKEN}" ]; then
+            break
+        fi
+    done
+
+    rm -f "${BATCH_FILE}"
+
+    # Final guard: make sure nothing slipped through. If the bucket
+    # still contains anything, surface it now rather than letting
+    # delete-stack fail with a cryptic "BucketNotEmpty" error.
+    local LEFT
+    LEFT=$(aws s3api list-object-versions --bucket "${BUCKET}" --region "${REGION}" \
+        --max-items 1 --output json 2>/dev/null \
+        | python3 -c 'import json, sys; d = json.load(sys.stdin); print(len(d.get("Versions") or []) + len(d.get("DeleteMarkers") or []))')
+    if [ "${LEFT}" -gt 0 ]; then
+        error "Bucket ${BUCKET} is not empty after walking all versions. Run aws s3api list-object-versions --bucket ${BUCKET} to investigate."
     fi
-    
-    # Delete delete-markers
-    aws s3api list-object-versions --bucket "${BUCKET}" --region "${REGION}" \
-        --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json 2>/dev/null \
-        | python3 -c "import sys, json; d = json.load(sys.stdin); print(json.dumps({'Objects': d.get('Objects') or []}))" \
-        > /tmp/delete-markers.json
-    if [ -s /tmp/delete-markers.json ] && [ "$(jq '.Objects | length' /tmp/delete-markers.json 2>/dev/null || echo 0)" -gt 0 ]; then
-        aws s3api delete-objects --bucket "${BUCKET}" --region "${REGION}" --delete file:///tmp/delete-markers.json > /dev/null || true
-    fi
-    
-    # Also remove any current (non-versioned) objects just in case
-    aws s3 rm "s3://${BUCKET}" --recursive --region "${REGION}" --quiet || true
-    
-    rm -f /tmp/delete-versions.json /tmp/delete-markers.json
+
     success "Emptied: ${BUCKET}"
 }
 
