@@ -257,7 +257,7 @@ The cache files are refreshed every 30 minutes by a separate Cache Compute Lambd
 |----------|-------------|
 | `GET /api/compliance-summary` | Aggregated stats for all accounts/regions |
 | `GET /api/compliance-detail?accountId=X&region=Y` | Instance details for specific account/region |
-| `GET /api/patches-index` | All missing patches with affected instances |
+| `GET /api/patches?accountId=X&region=Y` | Missing patches scoped to one account/region |
 
 ## Cache Format
 

@@ -18,7 +18,7 @@
 Tests the API endpoint handlers for:
 - get_compliance_summary()
 - get_compliance_detail()
-- get_patches_index()
+- get_patches()
 - error_response()
 - handler() routing
 
@@ -45,7 +45,7 @@ import handler as api_handler
 from handler import (
     get_compliance_summary,
     get_compliance_detail,
-    get_patches_index,
+    get_patches,
     error_response,
     handler,
 )
@@ -231,6 +231,7 @@ def affected_instance_strategy(draw):
         'instanceName': draw(st.text(min_size=1, max_size=50, alphabet=st.characters(whitelist_categories=('L', 'N'), whitelist_characters='-'))),
         'accountId': draw(account_id_strategy),
         'region': draw(region_strategy),
+        'instanceStatus': draw(instance_status_strategy),
     }
 
 
@@ -249,12 +250,19 @@ def patch_entry_strategy(draw):
     }
 
 
-# Strategy for generating a valid Patches Index
+# Strategy for generating a valid per-account/region patches cache
 @st.composite
-def patches_index_strategy(draw):
+def account_patches_strategy(draw):
+    """Mirrors what write_account_patches writes: patches list scoped to
+    a single account/region, self-describing with accountId/region/
+    generatedAt at the top level. The API Lambda echoes this file back
+    verbatim, so the round-trip property test asserts that exact shape.
+    """
     patches = draw(st.lists(patch_entry_strategy(), min_size=0, max_size=15))
     return {
         'generatedAt': draw(iso_timestamp_strategy),
+        'accountId': draw(account_id_strategy),
+        'region': draw(region_strategy),
         'totalPatches': len(patches),
         'patches': patches,
     }
@@ -269,7 +277,7 @@ class TestAPICacheRoundTrip:
     
     Feature: patch-compliance-dashboard, Property 6: API Cache Round-Trip
     
-    *For any* valid cache file (summary, detail, or patches-index), when the API
+    *For any* valid cache file (summary, detail, or per-account patches), when the API
     Lambda reads and returns the cache content, the returned JSON SHALL be
     equivalent to the original cache file content.
     
@@ -348,27 +356,33 @@ class TestAPICacheRoundTrip:
         assert 'platformSummary' in response_data
         assert response_data['generatedAt'] == detail_data.get('generatedAt')
     
-    @given(patches_data=patches_index_strategy())
+    @given(patches_data=account_patches_strategy())
     @settings(max_examples=100)
     @patch('handler.read_s3_file')
-    def test_patches_index_round_trip(self, mock_read, patches_data):
+    def test_patches_round_trip(self, mock_read, patches_data):
         """Feature: patch-compliance-dashboard, Property 6: API Cache Round-Trip
         
-        Patches index content is returned unchanged through the API.
+        Patches cache content is returned unchanged through the API.
         
         **Validates: Requirements 2.3**
         """
-        # Arrange: Mock S3 to return the generated patches index
+        # Arrange: Mock S3 to return the generated patches cache
         mock_read.return_value = json.dumps(patches_data)
-        
-        # Act: Call the API handler
-        event = {'path': '/api/patches-index', 'httpMethod': 'GET'}
+        account_id = patches_data['accountId']
+        region = patches_data['region']
+
+        # Act: Call the API handler with the new per-account/region endpoint
+        event = {
+            'path': '/api/patches',
+            'httpMethod': 'GET',
+            'queryStringParameters': {'accountId': account_id, 'region': region},
+        }
         result = handler(event, None)
-        
+
         # Assert: Response is successful and content matches exactly
         assert result['statusCode'] == 200
         assert result['headers']['Content-Type'] == 'application/json'
-        
+
         # Parse the response body and compare with original
         response_data = json.loads(result['body'])
         assert response_data == patches_data
@@ -433,7 +447,7 @@ class TestAPICacheRoundTrip:
         for inst in response_data.get('instances', []):
             assert 'missingPatches' not in inst
     
-    @given(patches_data=patches_index_strategy())
+    @given(patches_data=account_patches_strategy())
     @settings(max_examples=100)
     @patch('handler.read_s3_file')
     def test_json_structure_preserved_patches(self, mock_read, patches_data):
@@ -446,11 +460,17 @@ class TestAPICacheRoundTrip:
         # Arrange: Serialize and deserialize to verify JSON compatibility
         original_json = json.dumps(patches_data, sort_keys=True)
         mock_read.return_value = original_json
-        
+        account_id = patches_data['accountId']
+        region = patches_data['region']
+
         # Act: Call the API handler
-        event = {'path': '/api/patches-index', 'httpMethod': 'GET'}
+        event = {
+            'path': '/api/patches',
+            'httpMethod': 'GET',
+            'queryStringParameters': {'accountId': account_id, 'region': region},
+        }
         result = handler(event, None)
-        
+
         # Assert: JSON structure is preserved
         response_json = json.dumps(json.loads(result['body']), sort_keys=True)
         assert response_json == original_json
@@ -566,41 +586,64 @@ class TestGetComplianceDetail:
         assert calls[1][0] == ('test-dashboard-bucket', 'cache/detail/999888777666/ap-southeast-2.json')
 
 
-class TestGetPatchesIndex:
-    """Tests for get_patches_index() function."""
-    
+class TestGetPatches:
+    """Tests for get_patches() function (per-account/region patches cache)."""
+
     @patch('handler.read_s3_file')
     def test_returns_parsed_json_when_cache_exists(self, mock_read):
-        """Should return parsed JSON when patches index cache exists."""
+        """Should return parsed JSON when per-account/region patches cache exists."""
         expected_data = {
             'generatedAt': '2024-01-15T10:30:00Z',
-            'totalPatches': 5,
+            'accountId': '123456789012',
+            'region': 'us-east-1',
+            'totalPatches': 1,
             'patches': [{'patchId': 'KB123', 'affectedCount': 3}],
         }
         mock_read.return_value = json.dumps(expected_data)
-        
-        result = get_patches_index()
-        
+
+        result = get_patches('123456789012', 'us-east-1')
+
         assert result == expected_data
-        mock_read.assert_called_once_with('test-dashboard-bucket', 'cache/patches-index.json')
-    
+        mock_read.assert_called_once_with(
+            'test-dashboard-bucket',
+            'cache/patches/123456789012/us-east-1.json',
+        )
+
     @patch('handler.read_s3_file')
     def test_raises_cache_not_found_when_file_missing(self, mock_read):
-        """Should raise CacheNotFoundError when patches index doesn't exist."""
+        """Should raise CacheNotFoundError when the cache file does not exist."""
         mock_read.return_value = None
-        
+
         with pytest.raises(CacheNotFoundError):
-            get_patches_index()
-    
+            get_patches('123456789012', 'us-east-1')
+
     @patch('handler.read_s3_file')
     def test_raises_cache_not_found_on_invalid_json(self, mock_read):
         """Should raise CacheNotFoundError when cache contains invalid JSON."""
         mock_read.return_value = 'broken json'
-        
+
         with pytest.raises(CacheNotFoundError) as exc_info:
-            get_patches_index()
-        
+            get_patches('123456789012', 'us-east-1')
+
         assert 'corrupted' in str(exc_info.value.message).lower()
+
+    @patch('handler.read_s3_file')
+    def test_constructs_correct_s3_key_path(self, mock_read):
+        """Should construct the correct S3 key from account and region."""
+        mock_read.return_value = json.dumps({
+            'generatedAt': '2024-01-15T10:30:00Z',
+            'accountId': '999888777666',
+            'region': 'ap-southeast-2',
+            'totalPatches': 0,
+            'patches': [],
+        })
+
+        get_patches('999888777666', 'ap-southeast-2')
+
+        mock_read.assert_called_once_with(
+            'test-dashboard-bucket',
+            'cache/patches/999888777666/ap-southeast-2.json',
+        )
 
 
 class TestErrorResponse:
@@ -660,16 +703,64 @@ class TestHandler:
         # Handler passes pagination params (page=1, page_size=500, instance_id=None)
         mock_get_detail.assert_called_once_with('123456789012', 'us-east-1', 1, 500, None)
     
-    @patch('handler.get_patches_index')
-    def test_routes_patches_index_request(self, mock_get_patches):
-        """Should route /api/patches-index to get_patches_index()."""
-        mock_get_patches.return_value = {'patches': []}
-        event = {'path': '/api/patches-index', 'httpMethod': 'GET'}
-        
+    @patch('handler.get_patches')
+    def test_routes_patches_request(self, mock_get_patches):
+        """Should route /api/patches to get_patches() with accountId/region."""
+        mock_get_patches.return_value = {'patches': [], 'accountId': '123456789012', 'region': 'us-east-1'}
+        event = {
+            'path': '/api/patches',
+            'httpMethod': 'GET',
+            'queryStringParameters': {'accountId': '123456789012', 'region': 'us-east-1'},
+        }
+
         result = handler(event, None)
-        
+
         assert result['statusCode'] == 200
-        mock_get_patches.assert_called_once()
+        mock_get_patches.assert_called_once_with('123456789012', 'us-east-1')
+
+    def test_patches_returns_400_when_account_id_missing(self):
+        """Should return 400 when accountId is missing for /api/patches."""
+        event = {
+            'path': '/api/patches',
+            'httpMethod': 'GET',
+            'queryStringParameters': {'region': 'us-east-1'},
+        }
+        result = handler(event, None)
+        assert result['statusCode'] == 400
+        assert 'accountId' in json.loads(result['body'])['error']
+
+    def test_patches_returns_400_when_region_missing(self):
+        """Should return 400 when region is missing for /api/patches."""
+        event = {
+            'path': '/api/patches',
+            'httpMethod': 'GET',
+            'queryStringParameters': {'accountId': '123456789012'},
+        }
+        result = handler(event, None)
+        assert result['statusCode'] == 400
+        assert 'region' in json.loads(result['body'])['error']
+
+    def test_patches_returns_400_for_invalid_account_id_format(self):
+        """Should return 400 when accountId is not a 12-digit string."""
+        event = {
+            'path': '/api/patches',
+            'httpMethod': 'GET',
+            'queryStringParameters': {'accountId': '123', 'region': 'us-east-1'},
+        }
+        result = handler(event, None)
+        assert result['statusCode'] == 400
+        assert 'accountId' in json.loads(result['body'])['error']
+
+    def test_patches_returns_400_for_invalid_region_format(self):
+        """Should return 400 when region does not match AWS region pattern."""
+        event = {
+            'path': '/api/patches',
+            'httpMethod': 'GET',
+            'queryStringParameters': {'accountId': '123456789012', 'region': '../etc/passwd'},
+        }
+        result = handler(event, None)
+        assert result['statusCode'] == 400
+        assert 'region' in json.loads(result['body'])['error']
     
     def test_returns_400_when_account_id_missing(self):
         """Should return 400 when accountId is missing for compliance-detail."""
@@ -955,9 +1046,11 @@ class TestHandlerIntegration:
     
     @patch('handler.read_s3_file')
     def test_full_patches_request_flow(self, mock_read):
-        """Test complete flow for patches index request."""
+        """Test complete flow for /api/patches request."""
         patches_data = {
             'generatedAt': '2024-01-15T10:30:00Z',
+            'accountId': '123456789012',
+            'region': 'us-east-1',
             'totalPatches': 2,
             'patches': [
                 {
@@ -975,14 +1068,23 @@ class TestHandlerIntegration:
             ],
         }
         mock_read.return_value = json.dumps(patches_data)
-        
-        event = {'path': '/api/patches-index', 'httpMethod': 'GET'}
+
+        event = {
+            'path': '/api/patches',
+            'httpMethod': 'GET',
+            'queryStringParameters': {'accountId': '123456789012', 'region': 'us-east-1'},
+        }
         result = handler(event, None)
-        
+
         assert result['statusCode'] == 200
         body = json.loads(result['body'])
         assert body['totalPatches'] == 2
         assert len(body['patches']) == 2
+        # The handler must have read from the per-account/region key.
+        mock_read.assert_called_once_with(
+            'test-dashboard-bucket',
+            'cache/patches/123456789012/us-east-1.json',
+        )
 
 
 # =============================================================================

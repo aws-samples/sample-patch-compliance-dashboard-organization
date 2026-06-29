@@ -259,6 +259,58 @@ def detect_platform(platform_type: str, platform_name: str) -> str:
     return 'Unknown'
 
 
+def derive_patch_platform(patch_id: str, fallback: str = 'Unknown') -> str:
+    """Derive a patch's platform from its patch ID.
+
+    Patch IDs are themselves strong evidence of the target platform:
+    RPM patches carry architecture suffixes like .x86_64 / .noarch /
+    .aarch64 (sometimes followed by NEVRA version metadata such as
+    `glibc-common.x86_64:0:2.26-64.amzn2.0.6`), and Microsoft KB
+    patches are prefixed `KB` followed by digits. We prefer this over
+    the instance's reported PlatformType because hybrid-activated
+    managed instances and custom AMIs often register with an empty or
+    "Unknown" PlatformType, which would otherwise propagate to every
+    patch entry in the cache.
+
+    Args:
+        patch_id: The patch identifier (e.g., 'kernel.x86_64',
+                  'glibc-common.x86_64:0:2.26-64.amzn2.0.6',
+                  'KB5037768').
+        fallback: Platform to return when the ID matches no known
+                  pattern. Callers typically pass the instance's
+                  reported platform so a real signal beats this
+                  heuristic when available.
+
+    Returns:
+        Platform string: "Linux", "Windows", or the supplied fallback.
+    """
+    if not patch_id:
+        return fallback
+
+    pid = patch_id.strip()
+    if not pid:
+        return fallback
+
+    # Linux RPM/DEB architecture tokens. RPM IDs look like
+    # `package.arch` and may optionally carry a NEVRA tail
+    # (`:epoch:version-release`), so match the arch as a `.arch`
+    # token anywhere in the string rather than only at the end.
+    linux_arch_tokens = (
+        r'\.x86_64\b', r'\.noarch\b', r'\.i686\b', r'\.aarch64\b',
+        r'\.amd64\b', r'\.arm64\b', r'\.src\b', r'\.deb\b',
+    )
+    if re.search('|'.join(linux_arch_tokens), pid):
+        return 'Linux'
+
+    # Microsoft KB articles. Windows servicing IDs sometimes prefix the
+    # KB with the OS (e.g. Windows10.0-KB5037768), so match anywhere in
+    # the string after a word boundary.
+    if re.search(r'\bKB\d{5,}\b', pid):
+        return 'Windows'
+
+    return fallback
+
+
 def aggregate_summary(instances: list[dict], datasync_bucket: str = '') -> dict:
     """Build compliance-summary.json structure from instance data.
     
@@ -485,13 +537,21 @@ def build_patches_index(instances: list[dict]) -> dict:
                 patches_map[patch_id]['title'] = title
                 patches_map[patch_id]['severity'] = severity
                 patches_map[patch_id]['classification'] = classification
-                patches_map[patch_id]['platform'] = platform
+                # Derive platform from the patch ID itself first, falling
+                # back to the instance's reported platform when the ID
+                # doesn't match a known pattern. This protects against
+                # instances that register with empty/"Unknown"
+                # PlatformType (hybrid-activated SSM agents, custom AMIs,
+                # newly-launched instances) and would otherwise paint
+                # every obviously-Linux RPM as Unknown in the UI.
+                patches_map[patch_id]['platform'] = derive_patch_platform(patch_id, fallback=platform)
             
             patches_map[patch_id]['instances'].append({
                 'instanceId': instance_id,
                 'instanceName': instance_name,
                 'accountId': account_id,
                 'region': region,
+                'instanceStatus': instance.get('instanceStatus', 'Unknown'),
             })
     
     patches_list = []
@@ -661,26 +721,21 @@ def handler(event, context):
         # Step 2: Process each account/region
         generated_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         summaries = []
-        all_instances_for_patches_index = []
-        
+
         for idx, (account_id, region) in enumerate(account_regions, 1):
             print(f"[{idx}/{len(account_regions)}] Processing {account_id}/{region}", flush=True)
             try:
                 result = process_account_region(account_id, region, generated_at)
                 if result:
                     summaries.append(result['summary'])
-                    all_instances_for_patches_index.extend(result['instances_for_index'])
             except Exception as e:
                 logger.error(f"Error processing {account_id}/{region}: {e}", exc_info=True)
-        
-        # Step 3: Write summary cache
+
+        # Step 3: Write summary cache. Per-account/region patches caches
+        # were already written inline by process_account_region above.
         print(f"Writing summary cache with {len(summaries)} account/regions", flush=True)
         write_summary_cache(summaries, generated_at)
-        
-        # Step 4: Write patches index
-        print(f"Building patches index from {len(all_instances_for_patches_index)} instances", flush=True)
-        write_patches_index(all_instances_for_patches_index, generated_at)
-        
+
         print(f"Cache refresh complete: {len(summaries)} account/regions processed", flush=True)
         
         return {
@@ -943,10 +998,17 @@ def process_account_region(account_id, region, generated_at):
     
     summary['patchTypesLinux'] = patch_types_linux
     summary['patchTypesWindows'] = patch_types_windows
-    
-    # Prepare instances for patches index (all non-compliant instances with patches)
-    # Include instanceStatus so frontend can filter by Active/Terminated
-    instances_for_index = [
+
+    # Build and write the per-account/region patches cache.
+    # Previously the cache lambda accumulated every instance across every
+    # account/region and wrote one org-wide cache/patches-index.json. That
+    # file grew unboundedly with org size and tripped the ALB -> Lambda 1 MB
+    # response cap (HTTP 502 on /api/patches-index). The Missing Patches
+    # page already operates on a single account/region at a time, so the
+    # cache is now sharded to match: one file per account/region, written
+    # here inside process_account_region so the slim projection never
+    # leaves this function.
+    instances_for_patches = [
         {
             'instanceId': i['instanceId'],
             'computerName': i['computerName'],
@@ -958,10 +1020,10 @@ def process_account_region(account_id, region, generated_at):
         }
         for i in all_instances if i['missingPatches']
     ]
-    
+    write_account_patches(account_id, region, instances_for_patches, generated_at)
+
     return {
         'summary': summary,
-        'instances_for_index': instances_for_index,
     }
 
 
@@ -1252,6 +1314,38 @@ def write_summary_cache(summaries, generated_at):
     )
 
 
+def write_account_patches(account_id, region, instances, generated_at):
+    """Build and write the per-account/region patches cache file.
+
+    Aggregates `instances` (which must already be scoped to the given
+    account/region and slimmed to the patches-view projection) into a
+    patches-centric view and writes it to
+    cache/patches/{accountId}/{region}.json.
+
+    Always writes the file, even when `instances` is empty, so the API
+    Lambda returns 200 + empty patches rather than 503 for a
+    fully-patched account/region.
+    """
+    patches_data = build_patches_index(instances)
+    # build_patches_index returns patches in insertion order; the UI
+    # expects them sorted by affectedCount descending so the most
+    # impactful patches surface first when the table loads.
+    patches_data['patches'].sort(key=lambda x: x.get('affectedCount', 0), reverse=True)
+    patches_data['generatedAt'] = generated_at
+    patches_data['accountId'] = account_id
+    patches_data['region'] = region
+
+    key = f'cache/patches/{account_id}/{region}.json'
+    s3.put_object(
+        Bucket=DASHBOARD_BUCKET,
+        Key=key,
+        Body=json.dumps(patches_data),
+        ContentType='application/json',
+    )
+
+    print(f"  Wrote patches cache: {key} ({patches_data['totalPatches']} unique patches)", flush=True)
+
+
 def write_patches_index(instances, generated_at):
     """Build and write the patches-index.json cache file."""
     patches_map = defaultdict(lambda: {
@@ -1329,24 +1423,10 @@ def write_empty_caches():
             'patchTypesWindows': {'Critical': 0, 'Security': 0, 'Other': 0},
         },
     }
-    
-    empty_patches = {
-        'generatedAt': generated_at,
-        'totalPatches': 0,
-        'patches': [],
-    }
-    
     s3.put_object(
         Bucket=DASHBOARD_BUCKET,
         Key='cache/compliance-summary.json',
         Body=json.dumps(empty_summary),
-        ContentType='application/json'
-    )
-    
-    s3.put_object(
-        Bucket=DASHBOARD_BUCKET,
-        Key='cache/patches-index.json',
-        Body=json.dumps(empty_patches),
         ContentType='application/json'
     )
 

@@ -92,7 +92,7 @@ Output structure:
 - `cache/compliance-summary.json` — main dashboard rollups
 - `cache/detail/{accountId}/{region}.json` — small accounts (≤500 instances)
 - `cache/detail/{accountId}/{region}/meta.json` + `index.json` + `chunk_N.json` — large accounts (>500 instances)
-- `cache/patches-index.json` — patch-centric view
+- `cache/patches/{accountId}/{region}.json` — per-account/region patch-centric view (each file holds only the patches affecting that scope so the API stays under the ALB 1 MB response cap)
 
 Configured with `ReservedConcurrentExecutions: 1` to prevent overlapping invocations from racing on cache files.
 
@@ -114,7 +114,7 @@ When an account has more than 500 instances, the cache writer produces a directo
 On a detail request the API Lambda probes for `meta.json` first. If it exists, the request follows the chunked path; if not, it reads the single-file format and slices the requested page in memory. This keeps the API forward-compatible with both layouts and lets the cache writer choose per-account based on size at write time.
 
 ### API Lambda
-Serves three routes: `/api/compliance-summary`, `/api/compliance-detail`, `/api/patches-index`. Reads only from `cache/*` in the Dashboard bucket. Validates input with regex (`^\d{12}$` for account IDs, `^[a-z]{2}-[a-z]+-\d$` for regions) and clamps pagination parameters before any S3 lookup.
+Serves three routes: `/api/compliance-summary`, `/api/compliance-detail`, `/api/patches`. Reads only from `cache/*` in the Dashboard bucket. Validates input with regex (`^\d{12}$` for account IDs, `^[a-z]{2}-[a-z]+-\d$` for regions) and clamps pagination parameters before any S3 lookup.
 
 ### Frontend Lambda
 Serves the React SPA from `frontend/*` in the Dashboard bucket. Returns `index.html` for any path not matching a static asset. Emits security response headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy) on every response. Detects path traversal via `posixpath.normpath`.
